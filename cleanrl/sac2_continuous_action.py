@@ -14,7 +14,7 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 ############################
-from torch.func import functional_call, vmap, grad
+from torch.func import functional_call, vmap, grad, jacrev
 ############################
 
 
@@ -56,7 +56,7 @@ class Args:
     """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-3
     """the learning rate of the Q network network optimizer"""
-    policy_frequency: int = 2
+    policy_frequency: int = 10
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
@@ -168,6 +168,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     if args.track:
         import wandb
 
+
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -177,6 +178,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             monitor_gym=True,
             save_code=True,
         )
+        
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -285,6 +287,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
             ######## TRAIN GAMMA FUNCTION ########
 
+            ######## Following this tutorial: https://pytorch.org/tutorials/intermediate/per_sample_grads.html ########
+
             with torch.no_grad():
                 
                 params = {k: v.detach() for k, v in actor.named_parameters()}
@@ -307,10 +311,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, None, 0, None),randomness="same")
 
                 ft_per_sample_grads = ft_compute_sample_grad(params, buffers, data, alpha)
+                actor_next_grad = torch.cat([g.view(g.shape[0],-1) for g in ft_per_sample_grads.values()],dim=1) ###TODO: Sanity check this
+
+
 
                 
-
-                actor_next_grad = torch.cat([g.view(g.shape[0],-1) for g in ft_per_sample_grads.values()],dim=1) ###TODO: Sanity check this
                 # compute gamma for next state
 
 
@@ -342,7 +347,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             gamma2_values = qf2.forward_gamma(data.observations, data.actions)
             gamma_loss = F.mse_loss(gamma1_values, next_gamma_value) + F.mse_loss(gamma2_values, next_gamma_value)
 
-
+            # Print gradients of fc4 layer
+            #print("Gradients of fc4 layer (qf1):", qf1.fc4.weight.grad)
+            
+            
             gamma_optimizer.zero_grad()
             gamma_loss.backward()
             gamma_optimizer.step()
