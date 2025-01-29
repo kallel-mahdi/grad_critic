@@ -176,7 +176,7 @@ except ImportError:
 
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from stable_baselines3.common.type_aliases import (
-    ReplayBufferSamples,
+    #ReplayBufferSamples,
     RolloutBufferSamples,
 )
 from stable_baselines3.common.vec_env import VecNormalize
@@ -190,6 +190,16 @@ class PrioritizedReplayBufferSamples(NamedTuple):
     rewards: th.Tensor
     weights: np.ndarray
     indices: np.ndarray
+
+
+
+class ReplayBufferSamples(NamedTuple):
+    observations: th.Tensor
+    actions: th.Tensor
+    next_observations: th.Tensor
+    dones: th.Tensor
+    rewards: th.Tensor
+    discounts: th.Tensor
 
 
 class BaseBuffer(ABC):
@@ -316,6 +326,12 @@ class BaseBuffer(ABC):
         if env is not None:
             return env.normalize_reward(reward).astype(np.float32)
         return reward
+    
+
+
+
+
+
 
 
 class ReplayBuffer(BaseBuffer):
@@ -361,9 +377,10 @@ class ReplayBuffer(BaseBuffer):
         self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.discounts = np.ones((self.buffer_size, self.n_envs), dtype=np.float32)
 
         if psutil is not None:
-            total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
+            total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes + self.discounts.nbytes
             if self.next_observations is not None:
                 total_memory_usage += self.next_observations.nbytes
 
@@ -376,7 +393,12 @@ class ReplayBuffer(BaseBuffer):
                     f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
                 )
 
-    def add(self, obs: np.ndarray, next_obs: np.ndarray, action: np.ndarray, reward: np.ndarray, done: np.ndarray) -> None:
+    def add(self, obs: np.ndarray, next_obs: np.ndarray, action: np.ndarray, reward: np.ndarray, done: np.ndarray, discount: None) -> None:
+
+
+
+
+     
         # Copy to avoid modification by reference
         self.observations[self.pos] = np.array(obs).copy()
         if self.optimize_memory_usage:
@@ -387,6 +409,9 @@ class ReplayBuffer(BaseBuffer):
         self.actions[self.pos] = np.array(action).copy()
         self.rewards[self.pos] = np.array(reward).copy()
         self.dones[self.pos] = np.array(done).copy()
+
+        if discount is not None:
+            self.discounts[self.pos] = np.array(discount).copy()
 
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -427,8 +452,19 @@ class ReplayBuffer(BaseBuffer):
             next_obs,
             self.dones[batch_inds],
             self._normalize_reward(self.rewards[batch_inds], env),
+            self.discounts[batch_inds]
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+    
+
+    def get_all_transitions(self):
+        """
+        Get all transitions from the buffer.
+
+        :return: (ReplayBufferSamples) All transitions in the buffer.
+        """
+        batch_inds = np.arange(self.size())
+        return self._get_samples(batch_inds)
 
 
 class RolloutBuffer(BaseBuffer):

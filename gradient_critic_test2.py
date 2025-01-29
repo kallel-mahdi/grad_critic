@@ -11,11 +11,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from stable_baselines3.common.buffers import ReplayBuffer
+from cleanrl_utils.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 ############################
 from torch.func import functional_call, vmap, grad, jacrev
 ############################
+
 
 
 @dataclass
@@ -30,7 +31,7 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "gradient_critic"
+    wandb_project_name: str = "gradient_critic_test"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
@@ -38,11 +39,11 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "InvertedDoublePendulum-v4"
+    env_id: str = "Walker2d-v4"
     """the environment id of the task"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    buffer_size: int = int(1e6)
+    buffer_size: int = 50_000
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -50,19 +51,19 @@ class Args:
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 5e3
+    learning_starts: int = 0
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-3
     """the learning rate of the Q network network optimizer"""
-    policy_frequency: int = 10
+    policy_frequency: int = 1000
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
-    alpha: float = 0.2
+    alpha: float = 0.
     """Entropy regularization coefficient."""
-    autotune: bool = True
+    autotune: bool = False
     """automatic tuning of the entropy coefficient"""
 
 
@@ -95,7 +96,7 @@ class SoftQNetwork(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         q = self.fc3(x)
-        #gamma = self.fc4(x)
+      
       
         return q
     
@@ -197,6 +198,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    initial_obs = []
+
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs).to(device)
@@ -214,7 +217,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     # Automatic entropy tuning
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        log_alpha = -2.3* torch.ones(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
@@ -226,12 +229,24 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         envs.single_observation_space,
         envs.single_action_space,
         device,
-        handle_timeout_termination=False,
+        #handle_timeout_termination=False,
     )
+    
+    op_rb = ReplayBuffer(
+        args.policy_frequency,
+        envs.single_observation_space,
+        envs.single_action_space,
+        device,
+        #handle_timeout_termination=False,
+    )
+    
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+
+    discount = 1.
+
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -251,12 +266,16 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
 
+            discount *= args.gamma
+            initial_obs.append(next_obs)
+
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb.add(obs, real_next_obs, actions, rewards, terminations, discount)
+        op_rb.add(obs, real_next_obs, actions, rewards, terminations, discount)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -284,6 +303,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             q_optimizer.zero_grad()
             qf_loss.backward()
             q_optimizer.step()
+            
+            # update the target networks
+            if global_step % args.target_network_frequency == 0:
+                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             ######## TRAIN GAMMA FUNCTION ########
 
@@ -296,7 +322,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                 def compute_actor_loss(params,buffers,data,alpha):
 
-                    obs = data.next_observations.unsqueeze(0) ###NEXT OBS
+                    obs = data.next_observations.unsqueeze(0) ###MAKE SURE TO USE NEXT OBS
                     pi, log_pi, _ = functional_call(actor, (params, buffers), (obs,))
 
                     qf1_pi = qf1(obs, pi)
@@ -313,12 +339,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 ft_per_sample_grads = ft_compute_sample_grad(params, buffers, data, alpha)
                 actor_next_grad = torch.cat([g.view(g.shape[0],-1) for g in ft_per_sample_grads.values()],dim=1) ###TODO: Sanity check this
 
-
-
                 
                 # compute gamma for next state
-
-
                 def reshape_grads(actor,flattened_grads):
                     # Reshape the flattened gradients back to their original shapes
                     reshaped_grads = {}
@@ -326,7 +348,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     for name, param in actor.named_parameters():
                         param_shape = param.shape
                         param_size = param.numel()
-                        reshaped_grads[name] = flattened_grads[:, start_idx:start_idx + param_size].view(-1, *param_shape)
+                        reshaped_grads[name] = flattened_grads[start_idx:start_idx + param_size].view(*param_shape)
                         start_idx += param_size
 
                     # # Ensure that reshaped_grads and actor_next_grad are equal
@@ -334,7 +356,6 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     #     assert torch.allclose(gradient, ft_per_sample_grads[name]), f"Mismatch in gradients for {name}"
                     
                     return reshaped_grads
-
 
 
                 gamma1_next_target = qf1_target.forward_gamma(data.next_observations, next_state_actions)
@@ -347,10 +368,6 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             gamma2_values = qf2.forward_gamma(data.observations, data.actions)
             gamma_loss = F.mse_loss(gamma1_values, next_gamma_value) + F.mse_loss(gamma2_values, next_gamma_value)
 
-            # Print gradients of fc4 layer
-            #print("Gradients of fc4 layer (qf1):", qf1.fc4.weight.grad)
-            
-            
             gamma_optimizer.zero_grad()
             gamma_loss.backward()
             gamma_optimizer.step()
@@ -359,47 +376,97 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             ######## TRAIN ACTOR ########
             if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
                 
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.forward(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                # Compute gradient using data from old policy
 
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
 
-                    ##########################
+                batch_indexes = np.arange(rb.buffer_size - 2*args.policy_frequency, rb.buffer_size - args.policy_frequency)
+                off_data = rb._get_samples(batch_indexes)
+                off_obs , off_disc = off_data.observations, off_data.discounts
 
-                    a = (qf1.forward_gamma(data.observations, pi) + qf2.forward_gamma(data.observations, pi))/2
-                    b = (qf1.forward_gamma(data.observations, data.actions) + qf2.forward_gamma(data.observations, data.actions))/2
-                    grad_correction = (a-b)
-                    grad_correction = reshape_grads(actor,grad_correction)
-                    for name, param in actor.named_parameters():
-                            param.grad += grad_correction[name].mean(axis=0)
+                actor_optimizer.zero_grad()
 
-                    ##########################
-                    actor_optimizer.step()
+                pi, log_pi, _ = actor.forward(off_obs)
+                qf1_pi = qf1(off_obs, pi)
+                qf2_pi = qf2(off_obs, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                
+                actor_loss = (((alpha * log_pi) - min_qf_pi)*off_disc).sum()/off_disc.sum() ### not sure about the weighting
 
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.forward(data.observations)
-                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                actor_loss.backward()
 
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
-                    
+                off_policy_grad = {name: param.grad.clone() for name, param in actor.named_parameters()}
+             
+                ##################################
 
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                gamma_pi = (qf1.forward_gamma(off_obs, pi) + qf2.forward_gamma(off_obs, pi))/2
+                gamma_beta = (qf1.forward_gamma(off_obs, off_data.actions) + qf2.forward_gamma(off_obs, off_data.actions))/2
+
+                flat_grad_correction = (((gamma_pi - gamma_beta)*off_disc).sum(axis=0))/off_disc.sum()
+
+                grad_correction = reshape_grads(actor,flat_grad_correction)
+                for name, param in actor.named_parameters():
+                        param.grad += grad_correction[name]
+
+                # Save a copy of param grads
+                approximate_grad = {name: param.grad.clone() for name, param in actor.named_parameters()}
+
+               
+                ##########################
+               
+                # Compute gradient using policy gradient theorem
+                op_data = op_rb.get_all_transitions()
+                op_obs , op_disc = op_data.observations, op_data.discounts
+                actor_optimizer.zero_grad()
+
+                pi, log_pi, _ = actor.forward(op_obs)
+                qf1_pi = qf1(op_obs, pi)
+                qf2_pi = qf2(op_obs, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                
+                actor_loss = (((alpha * log_pi) - min_qf_pi)*op_disc).sum()/op_disc.sum() ### not sure about the weighting
+               
+                actor_loss.backward()
+
+                full_op_grad = {name: param.grad.clone() for name, param in actor.named_parameters()}
+
+                # Flatten the gradients
+                def flatten_gradients(grad_dict):
+                    return torch.cat([g.view(-1) for g in grad_dict.values()])
+
+                flat_off_policy_grad = flatten_gradients(off_policy_grad)
+                flat_approx_grad = flatten_gradients(approximate_grad)
+                flat_full_op_grad = flatten_gradients(full_op_grad)
+
+                # Compute cosine distance
+                cosine_distance = F.cosine_similarity(flat_approx_grad, flat_full_op_grad, dim=0)
+                cosine_distance_non_corrected = F.cosine_similarity(flat_approx_grad, flat_off_policy_grad, dim=0)
+
+                # Log the cosine distance
+                writer.add_scalar("losses/cosine_distance", cosine_distance.item(), global_step)
+                writer.add_scalar("losses/cosine_distance_non_corrected", cosine_distance_non_corrected.item(), global_step)
+
+                print(f'cosine_distance ',cosine_distance.item())
+                print(f'correction relative norm',torch.norm(flat_grad_correction)/torch.norm(flat_off_policy_grad))
+
+                actor_optimizer.step()
+
+                if args.autotune:
+                    with torch.no_grad():
+                        _, log_pi, _ = actor.forward(data.observations)
+                    alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+
+                    a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    a_optimizer.step()
+                    alpha = log_alpha.exp().item()
+
+                # Reset replay buffer and environment
+                rb.reset()
+                obs, _ = envs.reset(seed=args.seed)
+                initial_obs = [obs]
+
+
+          
 
             if global_step % 100 == 0:
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
@@ -407,7 +474,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                #writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
